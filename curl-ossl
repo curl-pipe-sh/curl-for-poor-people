@@ -18,6 +18,7 @@ usage() {
   echo "  -f                Fail on HTTP >= 400 (exit 22)"
   echo "  -4                Force IPv4 (require A record; else exit 6)"
   echo "  -6                Force IPv6 (require AAAA; else exit 6)"
+  echo "  -v, --verbose     Show debug output (DNS, openssl args, redirects)"
   echo "  -h, --help        Show this help"
 }
 
@@ -29,6 +30,7 @@ fail_on_error=false
 max_redirs=$MAX_REDIRECTS_DEFAULT
 force_v4=false
 force_v6=false
+verbose=false
 url=
 
 # ---- args ----
@@ -54,7 +56,6 @@ do
       shift
     ;;
     -L)
-      # default follows redirects; keep for compatibility
       shift
     ;;
     --max-redirs)
@@ -77,6 +78,10 @@ do
       force_v4=false
       shift
     ;;
+    -v|--verbose)
+      verbose=true
+      shift
+    ;;
     -h|--help)
       usage
       exit 0
@@ -95,13 +100,10 @@ done
 
 [ -n "${url:-}" ] || { usage; exit 2; }
 
-# default to https if no scheme
 case "$url" in
   http://*|https://*) : ;;
   *) url="https://$url" ;;
 esac
-
-# ---- helpers ----
 
 parse_url() {
   _u=$1
@@ -126,37 +128,48 @@ parse_url() {
 
 resolve_ip_v4() {
   _host=$1
+  ip=
   if command -v getent >/dev/null 2>&1
   then
     ip=$(getent ahostsv4 "$_host" 2>/dev/null | awk 'NF{print $1; exit}')
-    [ -n "${ip:-}" ] && { printf '%s\n' "$ip"; return 0; }
-    ip=$(getent hosts "$_host" 2>/dev/null | awk '$1 ~ /^([0-9]+\.){3}[0-9]+$/ {print $1; exit}')
-    [ -n "${ip:-}" ] && { printf '%s\n' "$ip"; return 0; }
   fi
-  if command -v nslookup >/dev/null 2>&1
+  if [ -z "${ip:-}" ] && command -v nslookup >/dev/null 2>&1
   then
-    ip=$(nslookup -type=A "$_host" 2>/dev/null | awk '/^Address: /{print $2; found=1} END{if(found) exit 0; else exit 1}')
-    [ -n "${ip:-}" ] && { printf '%s\n' "$ip"; return 0; }
+    ip=$(nslookup -type=A "$_host" 2>/dev/null | awk '/^Address: /{print $2; exit}')
   fi
-  return 1
+  [ -n "${ip:-}" ] || return 1
+  printf '%s\n' "$ip"
 }
 
 resolve_ip_v6() {
   _host=$1
+  ip6=
+
+  # Prefer getent; ignore IPv4-mapped (::ffff:a.b.c.d) and v4-in-v6 forms
   if command -v getent >/dev/null 2>&1
   then
-    ip6=$(getent ahostsv6 "$_host" 2>/dev/null | awk 'NF{print $1; exit}')
-    [ -n "${ip6:-}" ] && { printf '%s\n' "$ip6"; return 0; }
-    ip6=$(getent hosts "$_host" 2>/dev/null | awk '$1 ~ /:/ {print $1; exit}')
-    [ -n "${ip6:-}" ] && { printf '%s\n' "$ip6"; return 0; }
+    ip6=$(getent ahostsv6 "$_host" 2>/dev/null | awk '
+      {
+        ip=$1
+        # reject IPv4-mapped (::ffff:a.b.c.d) and ::a.b.c.d style
+        if (ip ~ /^::ffff:/) next
+        if (ip ~ /::[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+        # accept the first real IPv6 address
+        if (index(ip, ":") > 0) { print ip; exit }
+      }')
   fi
-  if command -v nslookup >/dev/null 2>&1
+
+  # Fallback to nslookup AAAA (never returns mapped v6)
+  if [ -z "${ip6:-}" ] && command -v nslookup >/dev/null 2>&1
   then
-    ip6=$(nslookup -type=AAAA "$_host" 2>/dev/null | awk '/has IPv6 address/ {print $NF; exit}')
-    [ -n "${ip6:-}" ] && { printf '%s\n' "$ip6"; return 0; }
+    ip6=$(nslookup -type=AAAA "$_host" 2>/dev/null \
+          | awk '/has IPv6 address/ { print $NF; exit }')
   fi
-  return 1
+
+  [ -n "${ip6:-}" ] || return 1
+  printf '%s\n' "$ip6"
 }
+
 
 bracket_if_ipv6() {
   case "$1" in
@@ -165,11 +178,6 @@ bracket_if_ipv6() {
   esac
 }
 
-# stream HTTPS response: headers -> $1, body raw -> $2
-# returns:
-#   0  success
-#   6  resolve error when -4/-6 requested
-#   1  connection/TLS failure
 fetch_https_stream() {
   hdrf=$1
   rawf=$2
@@ -177,24 +185,24 @@ fetch_https_stream() {
   _port=$4
   _path=$5
 
-  # honor -4/-6 strictly
   connect_host=
   if $force_v4
   then
-    if connect_host=$(resolve_ip_v4 "$_host")
-    then :; else
-      [ "$silent" = false ] || [ "$show_error" = true ] && echo "curl-ossl: could not resolve IPv4 for $_host" >&2 || true
+    connect_host=$(resolve_ip_v4 "$_host") || {
+      $verbose && echo ">>> no A record for $_host" >&2
       return 6
-    fi
+    }
+    $verbose && echo ">>> resolved IPv4: $connect_host" >&2
   elif $force_v6
   then
-    if connect_host=$(resolve_ip_v6 "$_host")
-    then :; else
-      [ "$silent" = false ] || [ "$show_error" = true ] && echo "curl-ossl: could not resolve IPv6 for $_host" >&2 || true
+    connect_host=$(resolve_ip_v6 "$_host") || {
+      $verbose && echo ">>> no AAAA record for $_host" >&2
       return 6
-    fi
+    }
+    $verbose && echo ">>> resolved IPv6: $connect_host" >&2
   else
     connect_host="$_host"
+    $verbose && echo ">>> using host as-is: $connect_host" >&2
   fi
 
   connect_target="$(bracket_if_ipv6 "$connect_host"):${_port}"
@@ -205,6 +213,7 @@ fetch_https_stream() {
     "-quiet -ign_eof -connect $connect_target -tls1_2 -servername $_host" \
     "-quiet -ign_eof -connect $connect_target -tls1_2"
   do
+    $verbose && echo ">>> openssl s_client $args" >&2
     errf=$(mktemp 2>/dev/null || echo "/tmp/curl-ossl.$$-err")
 
     printf '%b' "$req" \
@@ -221,42 +230,37 @@ fetch_https_stream() {
       } || true
 
     if head -n1 "$hdrf" | grep -q '^HTTP/'; then
-      rm -f "$errf" || true
+      $verbose && echo ">>> got HTTP response" >&2
+      rm -f "$errf"
       return 0
     fi
 
-    if [ "$silent" = false ] || [ "$show_error" = true ]
+    if [ "$silent" = false ] || [ "$show_error" = true ] || $verbose
     then
       sed 's/^/openssl: /' "$errf" >&2 || true
     fi
-    rm -f "$errf" || true
+    rm -f "$errf"
   done
 
   return 1
 }
 
-# decode chunked body (binary-safe): in=$1, out=$2
 dechunk_file() {
   in=$1
   out=$2
   : >"$out"
   exec 9<"$in"
 
-  read_crlf_line() {
-    IFS= read -r -u 9 line || return 1
-    line=$(printf '%s' "$line" | tr -d '\r')
-    return 0
-  }
-
-  while read_crlf_line
+  while IFS= read -r -u 9 line
   do
+    line=$(printf '%s' "$line" | tr -d '\r')
     sizehex=${line%%;*}
     [ -n "$sizehex" ] || continue
     case "$sizehex" in *[!0-9a-fA-F]* ) break ;; esac
     size=$((16#$(printf '%s' "$sizehex" | tr 'a-f' 'A-F')))
-    [ "$size" -gt 0 ] || { break; }
+    [ "$size" -gt 0 ] || break
     dd bs=1 count="$size" <&9 >>"$out" 2>/dev/null || true
-    IFS= read -r -u 9 _ || true  # consume CRLF
+    IFS= read -r -u 9 _ || true
   done
 
   exec 9<&-
@@ -268,16 +272,11 @@ follow() {
 
   while :; do
     n=$((n+1))
-    [ "$n" -le "$max_redirs" ] || { [ "$silent" = false ] && echo "curl-ossl: too many redirects" >&2; return 22; }
+    [ "$n" -le "$max_redirs" ] || { echo "curl-ossl: too many redirects" >&2; return 22; }
 
     set -- $(parse_url "$cur")
     proto=$1; host=$2; port=$3; path=$4
-
-    if [ "$proto" != https ]
-    then
-      [ "$silent" = false ] && echo "curl-ossl: only https supported (got $proto)" >&2
-      return 2
-    fi
+    $verbose && echo ">>> request: $proto://$host:$port$path" >&2
 
     hdrf=$(mktemp 2>/dev/null || echo "/tmp/curl-ossl.$$-hdr")
     rawf=$(mktemp 2>/dev/null || echo "/tmp/curl-ossl.$$-raw")
@@ -286,14 +285,12 @@ follow() {
     then
       rc=$?
       rm -f "$hdrf" "$rawf"
-      case "$rc" in
-        6)  return 6 ;;   # could not resolve host (forced family)
-        *)  [ "$silent" = false ] && echo "curl-ossl: connection failed" >&2; return 1 ;;
-      esac
+      return "$rc"
     fi
 
-    status=$(head -n1 "$hdrf" 2>/dev/null | awk '{print $2+0}')
+    status=$(head -n1 "$hdrf" | awk '{print $2+0}')
     [ -z "$status" ] && status=0
+    $verbose && echo ">>> HTTP status: $status" >&2
 
     if [ "$head_only" = true ]
     then
@@ -305,14 +302,13 @@ follow() {
     if [ "$status" -ge 300 ] && [ "$status" -lt 400 ]
     then
       loc=$(awk 'BEGIN{IGNORECASE=1} /^Location:/{sub(/^[^:]*:[[:space:]]*/,"",$0); print; exit}' "$hdrf" | tr -d '\r')
-      [ -n "$loc" ] || { [ "$silent" = false ] && echo "curl-ossl: redirect without Location" >&2; rm -f "$hdrf" "$rawf"; return 22; }
+      $verbose && echo ">>> redirect to $loc" >&2
       cur=$loc
       rm -f "$hdrf" "$rawf"
       continue
     fi
 
     te=$(awk 'BEGIN{IGNORECASE=1} /^Transfer-Encoding:/{print tolower($2)}' "$hdrf" | tr -d '\r')
-
     bodyf="$rawf"
     if [ "$te" = chunked ]
     then
