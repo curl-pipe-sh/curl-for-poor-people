@@ -1,0 +1,261 @@
+#!/usr/bin/env sh
+# curl-ossl v6 — minimal curl via openssl s_client
+# - Body -> stdout (like `curl URL`)
+# - Follows redirects (default, max 5)
+# - HTTP/1.1
+# - Dechunks chunked responses
+# - Always tries SNI first; falls back without SNI
+# - No /dev/tcp
+
+set -eu
+
+MAX_REDIRECTS_DEFAULT=5
+
+usage() {
+  echo "Usage: $0 [options] URL"
+  echo
+  echo "Options:"
+  echo "  -s               silent"
+  echo "  -o FILE          write body to FILE"
+  echo "  -I               headers only"
+  echo "  -L               follow redirects (default on)"
+  echo "  --max-redirs N   set redirect limit (default ${MAX_REDIRECTS_DEFAULT})"
+  echo "  -h, --help       show this help"
+}
+
+silent=false
+outfile=
+head_only=false
+max_redirs=$MAX_REDIRECTS_DEFAULT
+url=
+
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    -s)
+      silent=true
+      shift
+    ;;
+    -o)
+      [ $# -ge 2 ] || { usage; exit 2; }
+      outfile=$2
+      shift 2
+    ;;
+    -I)
+      head_only=true
+      shift
+    ;;
+    -L)
+      shift
+    ;;
+    --max-redirs)
+      [ $# -ge 2 ] || { usage; exit 2; }
+      max_redirs=$2
+      shift 2
+    ;;
+    -h|--help)
+      usage
+      exit 0
+    ;;
+    *)
+      url=$1
+      shift
+      break
+    ;;
+  esac
+done
+
+[ -n "${url:-}" ] || { usage; exit 2; }
+
+case "$url" in
+  http://*|https://*) : ;;
+  *) url="https://$url" ;;
+esac
+
+parse_url() {
+  _u=$1
+  case "$_u" in
+    *://*) proto=${_u%%://*}; rest=${_u#*://} ;;
+    *)     proto=https; rest=$_u ;;
+  esac
+  case "$rest" in
+    */*)   hostport=${rest%%/*}; path="/${rest#*/}" ;;
+    *)     hostport=$rest; path="/" ;;
+  esac
+  host=${hostport%%:*}
+  port=${hostport#*:}
+  [ "$host" = "$port" ] && port=""
+  [ -n "$host" ] || return 1
+  if [ -z "$port" ]
+  then
+    case "$proto" in
+      https) port=443 ;;
+      http)  port=80  ;;
+      *)     return 1 ;;
+    esac
+  fi
+  printf '%s %s %s %s\n' "$proto" "$host" "$port" "$path"
+  return 0
+}
+
+fetch_https() {
+  _host=$1
+  _port=$2
+  _path=$3
+
+  # HTTP/1.1; some servers reject 1.0
+  req="GET $_path HTTP/1.1\r\nHost: $_host\r\nUser-Agent: curl-ossl\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+
+  # Try SNI first (TLS1.3 then 1.2), then fallback without SNI (1.2)
+  for args in \
+    "-quiet -connect $_host:$_port -tls1_3 -servername $_host" \
+    "-quiet -connect $_host:$_port -tls1_2 -servername $_host" \
+    "-quiet -connect $_host:$_port -tls1_2"
+  do
+    errf=$(mktemp 2>/dev/null || echo "/tmp/curl-ossl.$$-err")
+    # Use %b so \r\n are honored even on quirky printf
+    body=$( ( printf '%b' "$req" | openssl s_client $args ) 2>"$errf" ) || {
+      if [ "$silent" = false ]
+      then
+        sed 's/^/openssl: /' "$errf" >&2 || true
+      fi
+      rm -f "$errf" || true
+      continue
+    }
+    rm -f "$errf" || true
+    printf '%s' "$body"
+    return 0
+  done
+
+  return 1
+}
+
+fetch_http() {
+  _host=$1 _port=$2 _path=$3
+  if command -v wget >/dev/null 2>&1
+  then
+    base="http://$_host"
+    [ "$_port" -ne 80 ] && base="$base:$_port"
+    wget -q -O - "$base$_path" || return 1
+    return 0
+  fi
+  return 1
+}
+
+split_hdr_body() {
+  awk '
+    BEGIN{h=1}
+    {
+      line=$0
+      sub(/\r$/,"",line)
+      if (h) {
+        if (line=="") { h=0; next }
+        print line >"/dev/fd/3"
+      } else {
+        print line
+      }
+    }'
+}
+
+dechunk() {
+  awk '
+    function fromhex(h,  r,n,i,c) {
+      r=0; n=length(h)
+      for(i=1;i<=n;i++){
+        c=tolower(substr(h,i,1)); r*=16
+        if(c>="0"&&c<="9") r+=c-"0"
+        else if(c>="a"&&c<="f") r+=10+index("abcdef",c)-1
+      }
+      return r
+    }
+    BEGIN { need= -1 }
+    {
+      # blank lines between chunks are harmless
+      if (need<0) {
+        # read size line (hex, may have ;ext)
+        if (match($0,/^[0-9A-Fa-f]+/)) {
+          size=substr($0, RSTART, RLENGTH)
+          need=fromhex(size)
+          if (need==0) exit
+        }
+        next
+      } else {
+        print $0
+        need -= length($0)
+        if (need<=0) { need= -1 }
+      }
+    }'
+}
+
+do_request() {
+  _proto=$1 _host=$2 _port=$3 _path=$4
+  if [ "$_proto" = "https" ]
+  then
+    fetch_https "$_host" "$_port" "$_path"
+  else
+    fetch_http "$_host" "$_port" "$_path"
+  fi
+}
+
+follow() {
+  cur=$1
+  n=0
+  while :; do
+    n=$((n+1))
+    [ "$n" -le "$max_redirs" ] || { [ "$silent" = false ] && echo "curl-ossl: too many redirects" >&2; return 22; }
+    set -- $(parse_url "$cur") || { [ "$silent" = false ] && echo "curl-ossl: invalid URL '$cur'" >&2; return 2; }
+    proto=$1 host=$2 port=$3 path=$4
+
+    raw=$(do_request "$proto" "$host" "$port" "$path") || { [ "$silent" = false ] && echo "curl-ossl: connection failed" >&2; return 1; }
+
+    hdrf=$(mktemp 2>/dev/null || echo "/tmp/curl-ossl.$$-hdr")
+    exec 3>"$hdrf"
+    body=$(printf '%s' "$raw" | split_hdr_body 3>&3)
+    exec 3>&-
+
+    status=$(head -n1 "$hdrf" 2>/dev/null | awk '{print $2+0}')
+    [ -z "$status" ] && status=0
+
+    if [ "$head_only" = true ]
+    then
+      cat "$hdrf"
+      rm -f "$hdrf" || true
+      return "$status"
+    fi
+
+    te=$(awk 'BEGIN{IGNORECASE=1} /^Transfer-Encoding:/{print tolower($2)}' "$hdrf" | tr -d '\r')
+
+    case "$status" in
+      301|302|303|307|308)
+        loc=$(awk 'BEGIN{IGNORECASE=1} /^Location:/{sub(/^[^:]*:[[:space:]]*/,"",$0); print; exit}' "$hdrf" | tr -d '\r')
+        rm -f "$hdrf" || true
+        [ -n "$loc" ] || { [ "$silent" = false ] && echo "curl-ossl: redirect without Location" >&2; return 22; }
+        case "$loc" in
+          http://*|https://*) cur="$loc" ;;
+          /*) cur="$proto://$host$loc" ;;
+          *)  base="${path%/*}"; [ -z "$base" ] && base="/"; cur="$proto://$host$base/$loc" ;;
+        esac
+        [ "$silent" = true ] || echo "curl-ossl: redirecting to $cur" >&2
+        continue
+      ;;
+      *)
+        if [ "$te" = "chunked" ]
+        then
+          body=$(printf '%s\n' "$body" | dechunk)
+        fi
+        if [ -n "${outfile:-}" ]
+        then
+          printf '%s\n' "$body" >"$outfile"
+        else
+          printf '%s\n' "$body"
+        fi
+        rm -f "$hdrf" || true
+        [ "$status" -ge 400 ] 2>/dev/null && return 22 || return 0
+      ;;
+    esac
+  done
+}
+
+follow "$url"
+rc=$?
+exit "$rc"
